@@ -276,12 +276,19 @@ async def create_incident(request: Request):
           "_traceId":tid,"_incomingTraceparent":valid_tp,"_tracestate":ts}
         state["otlp"]=build_otlp(run_id,body["publicMarker"],state["diagnosis"],dispatches,[],valid_tp,ts,tid,state["approvals"])
         with db() as c:
-            try:
-                initial_response=public_state(state)
-                c.execute("INSERT INTO incident_runs(run_id,request_digest,request_json,state_json,initial_response_json) VALUES(%s,%s,%s,%s,%s)",
-                    (run_id,digest,json.dumps({k:v for k,v in body.items() if k!="sensitive"}),json.dumps(state),json.dumps(initial_response)))
-            except psycopg.errors.UniqueViolation:
+            initial_response=public_state(state)
+            inserted = c.execute(
+                "INSERT INTO incident_runs(run_id,request_digest,request_json,state_json,initial_response_json) "
+                "VALUES(%s,%s,%s,%s,%s) ON CONFLICT (run_id) DO NOTHING RETURNING run_id",
+                (run_id,digest,json.dumps({k:v for k,v in body.items() if k!="sensitive"}),json.dumps(state),json.dumps(initial_response))
+            ).fetchone()
+            if inserted is None:
+                # A concurrent request won the unique-key race. ON CONFLICT avoids
+                # aborting the PostgreSQL transaction, so the committed row can be
+                # read safely and checked for exact idempotent replay.
                 old=c.execute("SELECT request_digest,state_json,initial_response_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
+                if old is None:
+                    raise RuntimeError("Concurrent run insert could not be recovered")
                 if old["request_digest"]!=digest: return JSONResponse(status_code=409,content={"error":"RUN_ID_CONFLICT"})
                 snap=old.get("initial_response_json")
                 return JSONResponse(status_code=200,content=snap if snap is not None else public_state(old["state_json"]))
