@@ -327,17 +327,21 @@ async def post_receipt(run_id: str, request: Request):
             else:
                 rejected = (wanted, ap)
 
-        # A single 503 retry is allowed for each diagnostic action.
+        # A single 503 retry is allowed for each logical tool action.
         for out in outcomes:
             if out.get("status") == 503 and out.get("attempt") == 1:
                 d = pending[(out["actionId"], out["callId"], out["attempt"])]
                 already_retried = any(x.get("actionId") == d["actionId"] and x.get("attempt") == 2
-                                      for x in state["dispatches"])
+                                      for x in state["actionLog"])
                 if not already_retried:
                     retry = make_dispatch(run_id, d["toolName"], d["arguments"], d["evidence"],
                                            d["phase"], 2, state.get("_traceId"),
                                            d["actionId"], d["callId"],
                                            tracestate=state.get("_tracestate") if state.get("_incomingTraceparent") else None)
+                    # A retried effect must retain its approval binding.
+                    for field in ("approvalId", "approvalNonce"):
+                        if field in d:
+                            retry[field] = d[field]
                     state["dispatches"].append(retry)
                     state["actionLog"].append(retry)
             elif out.get("status") == 0 and out.get("errorType") == "timeout":
