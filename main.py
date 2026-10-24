@@ -104,8 +104,8 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
         logical=logical_spans[aid]
         client=d.get("traceparent","").split("-")[2] if d.get("traceparent") else ident(8)
         rec=receipt_by_call.get((aid,attempt),{})
-        attrs={"ga5.action.id":aid,"ga5.attempt":attempt,"ga5.receipt.id":rec.get("receiptId"),
-               "ga5.receipt.nonce":rec.get("nonce"),"http.request.method":"POST",
+        attrs={"ga5.action.id":aid,"ga5.attempt":attempt,"ga5.receipt.id":rec.get("receiptId") or "",
+               "ga5.receipt.nonce":rec.get("nonce") or "","http.request.method":"POST",
                "http.request.resend_count":attempt-1}
         if rec.get("status") is not None: attrs["http.response.status_code"]=rec["status"]
         err=rec.get("status")==503 or rec.get("errorType")=="timeout"
