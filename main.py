@@ -144,12 +144,16 @@ def model_plan(body):
     names={x.get("name") for x in catalog}
     for d in plan["diagnostics"]:
         if d.get("toolName") not in names or not isinstance(d.get("arguments"),dict): raise ValueError("Invalid diagnostic tool")
-        if not d.get("evidence") or not set(d["evidence"])<=set(ev): raise ValueError("Invalid diagnostic evidence")
+        de=d.get("evidence")
+        if not isinstance(de,list) or not de or len(set(de))!=len(de) or not set(de)<=set(ev):
+            raise ValueError("Invalid diagnostic evidence")
     eff=plan.get("effect")
     if not isinstance(eff,dict) or eff.get("toolName") not in set(policy.get("effectTools",[])) or eff["toolName"] not in names:
         raise ValueError("Invalid effect plan")
     if not isinstance(eff.get("arguments"),dict): raise ValueError("Invalid effect arguments")
-    if not eff.get("evidence") or not set(eff["evidence"])<=set(ev): raise ValueError("Invalid effect evidence")
+    ee=eff.get("evidence")
+    if not isinstance(ee,list) or not ee or len(set(ee))!=len(ee) or not set(ee)<=set(ev):
+        raise ValueError("Invalid effect evidence")
     return plan
 
 def make_dispatch(run_id, tool, args, evidence, phase, attempt=1, trace_id=None, action_id=None, call_id=None, parent_tp=None):
@@ -237,7 +241,13 @@ async def post_receipt(run_id: str, request: Request):
             return JSONResponse(status_code=409,content={"error":"INVALID_STATE"})
         outcomes=receipt.get("outcomes",[])
         approvals_in=receipt.get("approvals",[])
-        pending={ (d["actionId"],d["callId"],d["attempt"]):d for d in state.get("dispatches",[]) }
+        if (not isinstance(outcomes,list) or not isinstance(approvals_in,list)
+                or any(not isinstance(out,dict) for out in outcomes)):
+            return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
+        recorded_keys={(r.get("actionId"),r.get("callId"),r.get("attempt"))
+                       for r in state.get("receiptLog",[]) if "callId" in r}
+        pending={ (d["actionId"],d["callId"],d["attempt"]):d for d in state.get("dispatches",[])
+                  if (d["actionId"],d["callId"],d["attempt"]) not in recorded_keys }
         seen=set()
         for out in outcomes:
             key=(out.get("actionId"),out.get("callId"),out.get("attempt"))
