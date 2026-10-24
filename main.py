@@ -78,8 +78,10 @@ def span(trace_id, span_id, parent_id, name, kind, run_id, marker, attrs=None, s
     if links: out["links"]=links
     return out
 
-def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=None, tracestate=None):
+def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=None, tracestate=None, trace_id=None):
     tid, parent, original_tp = trace_context(incoming_tp)
+    if isinstance(trace_id,str) and re.fullmatch(r"[0-9a-f]{32}",trace_id) and int(trace_id,16):
+        tid=trace_id
     server_id=ident(8); agent_id=ident(8); model_id=ident(8)
     spans=[
       span(tid,server_id,parent if original_tp else None,"POST /v2/incidents",2,run_id,marker,{"http.request.method":"POST","http.route":"/v2/incidents"}),
@@ -221,7 +223,7 @@ async def create_incident(request: Request):
           "actionLog":list(dispatches),"receiptLog":[],"otlp":{"resourceSpans":[]},"_planEffect":effect,
           "_effectActionId":action_id,"_approvalRequired":body["policy"].get("approvalRequiredFor",[]),
           "_traceId":tid,"_incomingTraceparent":valid_tp,"_tracestate":ts}
-        state["otlp"]=build_otlp(run_id,body["publicMarker"],state["diagnosis"],dispatches,[],valid_tp,ts)
+        state["otlp"]=build_otlp(run_id,body["publicMarker"],state["diagnosis"],dispatches,[],valid_tp,ts,tid)
         with db() as c:
             try:
                 initial_response=public_state(state)
@@ -261,8 +263,10 @@ async def post_receipt(run_id: str, request: Request):
             if prior["content_digest"]!=rd: return JSONResponse(status_code=409,content={"error":"RECEIPT_ID_CONFLICT"})
             snap=prior.get("response_json")
             return JSONResponse(status_code=200,content=snap if snap is not None else public_state(state))
-        if state.get("status") in ("completed","failed"):
+        if state.get("status")=="completed":
             return JSONResponse(status_code=409,content={"error":"INVALID_STATE"})
+        # A timed-out diagnostic suppresses effects immediately, but continue accepting
+        # results for other already-dispatched diagnostics so the audit log is complete.
         outcomes=receipt.get("outcomes",[])
         approvals_in=receipt.get("approvals",[])
         if (not isinstance(outcomes,list) or not isinstance(approvals_in,list)
@@ -360,10 +364,14 @@ async def post_receipt(run_id: str, request: Request):
             for r in state.get("receiptLog", [])
         )
 
+        outstanding_diagnostics=[d for d in state.get("dispatches",[]) if d.get("phase")=="diagnostic"]
         if timed_out:
-            state["status"] = "failed"
             if not any(x.get("reason") == "dependent_effect_suppressed" for x in state["suppressed"]):
                 state["suppressed"].append({"reason":"dependent_effect_suppressed"})
+            if not outstanding_diagnostics:
+                state["status"] = "failed"
+            else:
+                state["status"] = "waiting"
         elif not any_retry_pending and diagnostic_results and all(r is not None for r in diagnostic_results):
             all_ok = all(200 <= (r.get("status") or 0) < 300 for r in diagnostic_results)
             if not all_ok:
@@ -408,6 +416,8 @@ async def post_receipt(run_id: str, request: Request):
                         state["actionLog"].append(d)
 
         # Final status is derived from authoritative receipts for all dispatched work.
+        if state.get("status")=="waiting" and state.get("suppressed") and not state.get("dispatches"):
+            state["status"]="failed"
         effect_dispatches = [d for d in state["actionLog"] if d.get("phase") == "effect"]
         for d in effect_dispatches:
             rec = receipt_by_action_attempt.get((d["actionId"], d.get("attempt", 1)))
@@ -420,7 +430,7 @@ async def post_receipt(run_id: str, request: Request):
         # Remove internal fields from persisted/public state only after constructing final telemetry.
         request_body=c.execute("SELECT request_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()["request_json"]
         marker=request_body.get("publicMarker","")
-        state["otlp"]=build_otlp(run_id,marker,state["diagnosis"],state["actionLog"],state["receiptLog"],state.get("_incomingTraceparent"),state.get("_tracestate"))
+        state["otlp"]=build_otlp(run_id,marker,state["diagnosis"],state["actionLog"],state["receiptLog"],state.get("_incomingTraceparent"),state.get("_tracestate"),state.get("_traceId"))
         response_snapshot=public_state(state)
         c.execute("INSERT INTO incident_receipts(run_id,receipt_id,content_digest,receipt_json,response_json) VALUES(%s,%s,%s,%s,%s)",
             (run_id,receipt["receiptId"],rd,json.dumps(receipt),json.dumps(response_snapshot)))
