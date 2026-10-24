@@ -136,7 +136,7 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
     result={"resourceSpans":[{"resource":{"attributes":[attr("service.name","observable-incident-triage-ga3")]},"scopeSpans":[{"scope":{"name":"incident-agent"},"spans":spans}]}]}
     return result
 
-def model_plan(body):
+def _model_plan_once(body, correction=None):
     incident=body["incident"]; catalog=body["toolCatalog"]; policy=body["policy"]
     allowed=set(incident.get("allowedRootCauses",[]))
     evidence_lines=list(dict.fromkeys(re.findall(r"(\[[^\]]+\])", incident.get("transcript",""))))
@@ -150,6 +150,13 @@ def model_plan(body):
       "evidenceRule":"Every evidence value must be copied as the exact full bracketed ID, including square brackets, such as [E1]. Do not return bare IDs like E1, explanations, or altered labels.",
       "outputSchema":{"rootCause":"exact allowedRootCauses value","evidence":["2-4 IDs copied exactly from availableEvidenceIds"],"diagnostics":[{"toolName":"exact toolCatalog name","arguments":{},"evidence":["IDs copied exactly from availableEvidenceIds"]}],"effect":{"toolName":"exact tool name selected from policy.effectTools (must also exist in toolCatalog)","arguments":{},"evidence":["IDs copied exactly from availableEvidenceIds"]}}
     }
+    if correction:
+        prompt["validationCorrection"] = (
+            "Your previous response failed server validation: " + str(correction) +
+            ". Return a corrected JSON object only. Choose exactly 2-4 distinct evidence IDs copied from availableEvidenceIds; " +
+            "each diagnostic must use an exact toolCatalog name, object arguments, and at least one diagnosis evidence ID. " +
+            "Return 1-3 necessary diagnostics and one policy-approved effect."
+        )
     key=os.getenv("GEMINI_API_KEY")
     if not key:
         raise ValueError("Model provider is not configured")
@@ -166,7 +173,7 @@ def model_plan(body):
         MODEL_NAME,prompt_chars,request_json_chars)
     started=time.monotonic()
     try:
-        response=requests.post(api_url,params={"key":key},json=payload,timeout=12)
+        response=requests.post(api_url,params={"key":key},json=payload,timeout=7)
     except requests.RequestException as exc:
         logging.getLogger("uvicorn.error").warning(
             "AI_REQUEST_END provider=gemini model=%s error_type=%s elapsed_ms=%s",
@@ -235,6 +242,17 @@ def model_plan(body):
     if not isinstance(ee,list) or not ee or len(set(ee))!=len(ee) or not set(ee)<=set(ev):
         raise ValueError("Invalid effect evidence")
     return plan
+
+def model_plan(body):
+    # Model output can occasionally miss strict evidence/tool-plan validation.
+    # Make one bounded corrective attempt instead of immediately returning HTTP 422.
+    try:
+        return _model_plan_once(body)
+    except ValueError as exc:
+        logging.getLogger("uvicorn.error").warning(
+            "AI_PLAN_VALIDATION_RETRY reason=%s", str(exc)[:100])
+        return _model_plan_once(body, correction=str(exc))
+
 
 def make_dispatch(run_id, tool, args, evidence, phase, attempt=1, trace_id=None, action_id=None, call_id=None, parent_tp=None, tracestate=None):
     aid=action_id or "act_"+ident(8); cid=call_id or "call_"+ident(8)
