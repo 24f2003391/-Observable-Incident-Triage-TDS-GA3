@@ -78,7 +78,7 @@ def span(trace_id, span_id, parent_id, name, kind, run_id, marker, attrs=None, s
     if links: out["links"]=links
     return out
 
-def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=None, tracestate=None, trace_id=None):
+def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=None, tracestate=None, trace_id=None, approvals=None):
     tid, parent, original_tp = trace_context(incoming_tp)
     if isinstance(trace_id,str) and re.fullmatch(r"[0-9a-f]{32}",trace_id) and int(trace_id,16):
         tid=trace_id
@@ -123,9 +123,16 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
                 links.append({"traceId":tid,"spanId":logical_spans[d["actionId"]]})
                 linked.add(d["actionId"])
         spans.append(span(tid,ident(8),agent_id,"incident.join",1,run_id,marker,links=links))
-    if any("approvalId" in r for r in receipt_log):
-        approval=next(r for r in receipt_log if "approvalId" in r)
-        spans.append(span(tid,ident(8),agent_id,"approval_gate",1,run_id,marker,{"ga5.approval.id":approval.get("approvalId"),"ga5.approval.receipt.nonce":approval.get("nonce")}))
+    approval_receipt=next((r for r in receipt_log if "approvalId" in r), None)
+    pending_or_recorded_approvals=list(approvals or [])
+    approval_state=next((a for a in pending_or_recorded_approvals
+                         if a.get("approvalId") == (approval_receipt or {}).get("approvalId")
+                         or a.get("status", "pending") == "pending"), None)
+    if approval_receipt or approval_state:
+        approval_id=(approval_receipt or {}).get("approvalId") or approval_state.get("approvalId")
+        spans.append(span(tid,ident(8),agent_id,"approval_gate",1,run_id,marker,
+            {"ga5.approval.id":approval_id,
+             "ga5.approval.receipt.nonce":(approval_receipt or {}).get("nonce", "")}))
     result={"resourceSpans":[{"resource":{"attributes":[attr("service.name","observable-incident-triage-ga3")]},"scopeSpans":[{"scope":{"name":"incident-agent"},"spans":spans}]}]}
     return result
 
@@ -227,7 +234,7 @@ async def create_incident(request: Request):
           "actionLog":list(dispatches),"receiptLog":[],"otlp":{"resourceSpans":[]},"_planEffect":effect,
           "_effectActionId":action_id,"_approvalRequired":body["policy"].get("approvalRequiredFor",[]),
           "_traceId":tid,"_incomingTraceparent":valid_tp,"_tracestate":ts}
-        state["otlp"]=build_otlp(run_id,body["publicMarker"],state["diagnosis"],dispatches,[],valid_tp,ts,tid)
+        state["otlp"]=build_otlp(run_id,body["publicMarker"],state["diagnosis"],dispatches,[],valid_tp,ts,tid,state["approvals"])
         with db() as c:
             try:
                 initial_response=public_state(state)
@@ -450,7 +457,7 @@ async def post_receipt(run_id: str, request: Request):
         # Remove internal fields from persisted/public state only after constructing final telemetry.
         request_body=c.execute("SELECT request_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()["request_json"]
         marker=request_body.get("publicMarker","")
-        state["otlp"]=build_otlp(run_id,marker,state["diagnosis"],state["actionLog"],state["receiptLog"],state.get("_incomingTraceparent"),state.get("_tracestate"),state.get("_traceId"))
+        state["otlp"]=build_otlp(run_id,marker,state["diagnosis"],state["actionLog"],state["receiptLog"],state.get("_incomingTraceparent"),state.get("_tracestate"),state.get("_traceId"),state.get("approvals"))
         response_snapshot=public_state(state)
         c.execute("INSERT INTO incident_receipts(run_id,receipt_id,content_digest,receipt_json,response_json) VALUES(%s,%s,%s,%s,%s)",
             (run_id,receipt["receiptId"],rd,json.dumps(receipt),json.dumps(response_snapshot)))
