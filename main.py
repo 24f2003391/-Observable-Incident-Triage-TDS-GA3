@@ -262,6 +262,21 @@ async def create_incident(request: Request):
     run_id=body["runId"]
     if not isinstance(run_id,str) or not run_id: return JSONResponse(status_code=422,content={"error":"invalid_request"})
     digest=sha(body)
+    # Serialize requests for the same run ID across the model call and DB write.
+    # This prevents simultaneous exact replays from making duplicate Gemini calls.
+    try:
+        with db() as lock_conn:
+            lock_conn.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", (run_id,))
+            try:
+                return create_incident_locked(body, run_id, digest, request)
+            finally:
+                lock_conn.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (run_id,))
+    except Exception as exc:
+        logging.exception("incident lock/creation failed for run_id=%s (%s)", run_id, type(exc).__name__)
+        return JSONResponse(status_code=503, content={"error":"incident_temporarily_unavailable"})
+
+
+def create_incident_locked(body, run_id, digest, request):
     # Same run IDs with changed content conflict; exact replay returns stored state.
     with db() as c:
         old=c.execute("SELECT request_digest,state_json,initial_response_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
