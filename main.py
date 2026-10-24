@@ -170,7 +170,7 @@ async def create_incident(request: Request):
     for key in ("runId","agentName","publicMarker","incident","toolCatalog","policy"):
         if key not in body: return JSONResponse(status_code=422,content={"error":"invalid_request"})
     run_id=body["runId"]
-    if not isinstance(run_id,str) or not run_id: return JSONResponse(422,{"error":"invalid_request"})
+    if not isinstance(run_id,str) or not run_id: return JSONResponse(status_code=422,content={"error":"invalid_request"})
     digest=sha(body)
     # Same run IDs with changed content conflict; exact replay returns stored state.
     with db() as c:
@@ -203,8 +203,8 @@ async def create_incident(request: Request):
                     (run_id,digest,json.dumps({k:v for k,v in body.items() if k!="sensitive"}),json.dumps(state)))
             except psycopg.errors.UniqueViolation:
                 old=c.execute("SELECT request_digest,state_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
-                if old["request_digest"]!=digest: return JSONResponse(409,{"error":"RUN_ID_CONFLICT"})
-                return JSONResponse(200,public_state(old["state_json"]))
+                if old["request_digest"]!=digest: return JSONResponse(status_code=409,content={"error":"RUN_ID_CONFLICT"})
+                return JSONResponse(status_code=200,content=public_state(old["state_json"]))
         return JSONResponse(status_code=200,content=public_state(state))
     except Exception:
         return JSONResponse(status_code=422,content={"error":"incident_plan_invalid"})
@@ -219,18 +219,18 @@ def get_incident(run_id: str):
 @app.post("/v2/incidents/{run_id}/receipts")
 async def post_receipt(run_id: str, request: Request):
     try: receipt=await request.json()
-    except Exception: return JSONResponse(400,{"error":"invalid_json"})
+    except Exception: return JSONResponse(status_code=400,content={"error":"invalid_json"})
     if not isinstance(receipt,dict) or not isinstance(receipt.get("receiptId"),str) or not receipt["receiptId"]:
         return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
     rd=sha(receipt)
     with db() as c:
         row=c.execute("SELECT state_json FROM incident_runs WHERE run_id=%s FOR UPDATE",(run_id,)).fetchone()
-        if not row: return JSONResponse(404,{"error":"not_found"})
+        if not row: return JSONResponse(status_code=404,content={"error":"not_found"})
         state=row["state_json"]
         prior=c.execute("SELECT content_digest FROM incident_receipts WHERE run_id=%s AND receipt_id=%s",(run_id,receipt["receiptId"])).fetchone()
         if prior:
             if prior["content_digest"]!=rd: return JSONResponse(status_code=409,content={"error":"RECEIPT_ID_CONFLICT"})
-            return JSONResponse(200,public_state(state))
+            return JSONResponse(status_code=200,content=public_state(state))
         if state.get("status") in ("completed","failed"):
             return JSONResponse(status_code=409,content={"error":"INVALID_STATE"})
         outcomes=receipt.get("outcomes",[])
@@ -309,4 +309,4 @@ async def post_receipt(run_id: str, request: Request):
         c.execute("INSERT INTO incident_receipts(run_id,receipt_id,content_digest,receipt_json) VALUES(%s,%s,%s,%s)",
             (run_id,receipt["receiptId"],rd,json.dumps(receipt)))
         c.execute("UPDATE incident_runs SET state_json=%s,updated_at=now() WHERE run_id=%s",(json.dumps(state),run_id))
-    return JSONResponse(200,public_state(state))
+    return JSONResponse(status_code=200,content=public_state(state))
