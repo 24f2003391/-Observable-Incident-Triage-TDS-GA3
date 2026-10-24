@@ -146,7 +146,8 @@ def model_plan(body):
       "incident":{k:incident.get(k) for k in ("incidentId","title","service","severity","transcript","allowedRootCauses")},
       "toolCatalog":catalog,
       "policy":{k:policy.get(k) for k in ("maximumDiagnostics","effectTools","approvalRequiredFor")},
-      "outputSchema":{"rootCause":"exact allowedRootCauses value","evidence":["2-4 exact bracketed evidence IDs"],"diagnostics":[{"toolName":"exact toolCatalog name","arguments":{},"evidence":["evidence ID"]}],"effect":{"toolName":"exact tool name selected from policy.effectTools (must also exist in toolCatalog)","arguments":{},"evidence":["evidence ID"]}}
+      "availableEvidenceIds":evidence_lines,
+      "outputSchema":{"rootCause":"exact allowedRootCauses value","evidence":["2-4 IDs copied exactly from availableEvidenceIds"],"diagnostics":[{"toolName":"exact toolCatalog name","arguments":{},"evidence":["IDs copied exactly from availableEvidenceIds"]}],"effect":{"toolName":"exact tool name selected from policy.effectTools (must also exist in toolCatalog)","arguments":{},"evidence":["IDs copied exactly from availableEvidenceIds"]}}
     }
     key=os.getenv("GEMINI_API_KEY")
     if not key:
@@ -181,8 +182,26 @@ def model_plan(body):
     except (KeyError, IndexError, TypeError):
         raise ValueError("Model returned no JSON content")
     plan=json.loads(response_text)
-    if plan.get("rootCause") not in allowed: raise ValueError("Invalid model root cause")
+    # Normalize only a bracket-format omission when the underlying ID is known
+    # from the transcript. Never admit an ID that is not present in the source.
     valid=set(evidence_lines)
+    def normalize_evidence(value):
+        if not isinstance(value,list):
+            return value
+        normalized=[]
+        for item in value:
+            if isinstance(item,str) and item not in valid and ("["+item+"]") in valid:
+                item="["+item+"]"
+            normalized.append(item)
+        return normalized
+    plan["evidence"]=normalize_evidence(plan.get("evidence",[]))
+    if isinstance(plan.get("diagnostics"),list):
+        for diagnostic in plan["diagnostics"]:
+            if isinstance(diagnostic,dict):
+                diagnostic["evidence"]=normalize_evidence(diagnostic.get("evidence",[]))
+    if isinstance(plan.get("effect"),dict):
+        plan["effect"]["evidence"]=normalize_evidence(plan["effect"].get("evidence",[]))
+    if plan.get("rootCause") not in allowed: raise ValueError("Invalid model root cause")
     ev=plan.get("evidence",[])
     if not isinstance(ev,list) or not 2 <= len(ev) <= 4 or len(set(ev)) != len(ev) or not set(ev)<=valid:
         raise ValueError("Invalid diagnosis evidence")
