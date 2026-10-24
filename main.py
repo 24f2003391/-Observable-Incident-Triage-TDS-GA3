@@ -1,4 +1,4 @@
-import os, json, hashlib, re, uuid, secrets, time, logging
+import os, json, hashlib, re, uuid, secrets, time, logging, hmac
 from datetime import datetime, timezone
 from typing import Any
 from fastapi import FastAPI, Request
@@ -145,7 +145,11 @@ def model_plan(body):
     if not key:
         raise ValueError("Model provider is not configured")
     from google import genai
-    client=genai.Client(api_key=key)
+    from google.genai import types
+    # Bound the provider request and disable SDK retries so this endpoint stays
+    # inside the grader's 18-second request deadline.
+    client=genai.Client(api_key=key, http_options=types.HttpOptions(
+        timeout=13000, retry_options=types.HttpRetryOptions(attempts=1)))
     response=client.models.generate_content(model=MODEL_NAME, contents=canonical(prompt),
        config={"response_mime_type":"application/json","temperature":0})
     plan=json.loads(response.text)
@@ -263,7 +267,7 @@ async def post_receipt(run_id: str, request: Request):
             if prior["content_digest"]!=rd: return JSONResponse(status_code=409,content={"error":"RECEIPT_ID_CONFLICT"})
             snap=prior.get("response_json")
             return JSONResponse(status_code=200,content=snap if snap is not None else public_state(state))
-        if state.get("status")=="completed":
+        if state.get("status") in ("completed", "failed"):
             return JSONResponse(status_code=409,content={"error":"INVALID_STATE"})
         # A timed-out diagnostic suppresses effects immediately, but continue accepting
         # results for other already-dispatched diagnostics so the audit log is complete.
@@ -301,9 +305,13 @@ async def post_receipt(run_id: str, request: Request):
                            and a.get("status", "pending") == "pending"), None)
             if not wanted or ap.get("decision") not in ("approved", "rejected"):
                 return JSONResponse(status_code=422, content={"error":"APPROVAL_NOT_PENDING"})
-            if not isinstance(ap.get("nonce"), str) or not ap["nonce"]:
+            expected_nonce = wanted.get("nonce")
+            supplied_nonce = ap.get("nonce")
+            if (not isinstance(expected_nonce, str) or not expected_nonce
+                    or not isinstance(supplied_nonce, str)
+                    or not hmac.compare_digest(supplied_nonce, expected_nonce)):
                 return JSONResponse(status_code=422, content={"error":"INVALID_APPROVAL_NONCE"})
-            wanted["nonce"] = ap["nonce"]
+            wanted["nonce"] = supplied_nonce
             wanted["status"] = ap["decision"]
             wanted["decision"] = ap["decision"]
             wanted["receiptId"] = receipt["receiptId"]
@@ -393,6 +401,7 @@ async def post_receipt(run_id: str, request: Request):
                     state["approvals"].append({
                         "approvalId": "apr_" + ident(8),
                         "actionId": state.get("_effectActionId"),
+                        "nonce": secrets.token_urlsafe(32),
                         "toolName": tool,
                         "argumentsDigest": sha(effect.get("arguments", {})),
                         "status": "pending"
@@ -419,7 +428,14 @@ async def post_receipt(run_id: str, request: Request):
         if state.get("status")=="waiting" and state.get("suppressed") and not state.get("dispatches"):
             state["status"]="failed"
         effect_dispatches = [d for d in state["actionLog"] if d.get("phase") == "effect"]
+        # Evaluate only the latest attempt for each logical effect. A 503 on
+        # attempt 1 must not make the run terminal while attempt 2 is pending.
+        latest_effects = {}
         for d in effect_dispatches:
+            previous = latest_effects.get(d["actionId"])
+            if previous is None or d.get("attempt", 1) > previous.get("attempt", 1):
+                latest_effects[d["actionId"]] = d
+        for d in latest_effects.values():
             rec = receipt_by_action_attempt.get((d["actionId"], d.get("attempt", 1)))
             if rec is not None:
                 if 200 <= (rec.get("status") or 0) < 300:
