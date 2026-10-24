@@ -324,6 +324,28 @@ async def post_receipt(run_id: str, request: Request):
                 or any(not isinstance(out,dict) for out in outcomes+approvals_in)
                 or (not outcomes and not approvals_in)):
             return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
+        # Validate every outcome's shape before processing any receipt data.
+        # In particular, bool is not accepted as an HTTP status/attempt even
+        # though bool is a subclass of int in Python.
+        for out in outcomes:
+            status = out.get("status")
+            attempt = out.get("attempt")
+            if (not isinstance(out.get("actionId"), str) or not out["actionId"]
+                    or not isinstance(out.get("callId"), str) or not out["callId"]
+                    or type(attempt) is not int or attempt < 1
+                    or type(status) is not int or status < 0 or status > 599):
+                return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
+            error_type = out.get("errorType")
+            if error_type is not None and not isinstance(error_type, str):
+                return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
+            if ((status == 0 and error_type != "timeout")
+                    or (status != 0 and error_type == "timeout")):
+                return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
+        for ap in approvals_in:
+            if (not isinstance(ap.get("approvalId"), str) or not ap["approvalId"]
+                    or not isinstance(ap.get("nonce"), str) or not ap["nonce"]
+                    or ap.get("decision") not in ("approved", "rejected")):
+                return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
         recorded_keys={(r.get("actionId"),r.get("callId"),r.get("attempt"))
                        for r in state.get("receiptLog",[]) if "callId" in r}
         pending={ (d["actionId"],d["callId"],d["attempt"]):d for d in state.get("dispatches",[])
