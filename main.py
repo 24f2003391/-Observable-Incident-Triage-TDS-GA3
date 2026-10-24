@@ -90,7 +90,7 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
         if "callId" in r: receipt_by_call[(r["actionId"],r["attempt"])]=r
     for d in dispatches:
         aid=d["actionId"]; call=d["callId"]; tool=d["toolName"]; attempt=d["attempt"]
-        logical=ident(8); client=d.get("_clientSpanId") or ident(8)
+        logical=ident(8); client=d.get("traceparent","").split("-")[2] if d.get("traceparent") else ident(8)
         spans.append(span(tid,logical,agent_id,"execute_tool "+tool,1,run_id,marker,{"ga5.action.id":aid,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call,"gen_ai.operation.name":"execute_tool"}))
         rec=receipt_by_call.get((aid,attempt),{})
         attrs={"ga5.action.id":aid,"ga5.attempt":attempt,"ga5.receipt.id":rec.get("receiptId"),
@@ -189,14 +189,13 @@ async def create_incident(request: Request):
         action_id="act_"+ident(8)
         approvals=[]
         effect_dispatches=[]
-        if effect_tool in set(body["policy"].get("approvalRequiredFor",[])):
-            approval_id="approval_"+ident(8)
-            approvals=[{"approvalId":approval_id,"actionId":action_id,"toolName":effect_tool,"argumentsDigest":sha(effect["arguments"])}]
-        # Effect only follows successful diagnostic receipts; initial response contains diagnostics or approval request only.
+        # Approval is requested only after prerequisite diagnostics succeed.
+        # Destructive effects never appear in the initial response.
         state={"runId":run_id,"status":"waiting","diagnosis":{"rootCause":plan["rootCause"],"evidence":plan["evidence"]},
           "dispatches":dispatches,"approvals":approvals,"chosenEffect":effect_tool,"suppressed":[],
           "actionLog":[],"receiptLog":[],"otlp":{"resourceSpans":[]},"_planEffect":effect,
-          "_effectActionId":action_id,"_traceId":tid,"_incomingTraceparent":valid_tp,"_tracestate":ts}
+          "_effectActionId":action_id,"_approvalRequired":body["policy"].get("approvalRequiredFor",[]),
+          "_traceId":tid,"_incomingTraceparent":valid_tp,"_tracestate":ts}
         state["otlp"]=build_otlp(run_id,body["publicMarker"],state["diagnosis"],dispatches,[],valid_tp,ts)
         with db() as c:
             try:
