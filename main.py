@@ -98,7 +98,7 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
         if aid not in logical_spans:
             logical=ident(8)
             spans.append(span(tid,logical,agent_id,"execute_tool "+tool,1,run_id,marker,
-                {"ga5.action.id":aid,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call,
+                {"ga5.action.id":aid,"gen_ai.tool.name":tool,"ga5.tool.call.id":call,
                  "gen_ai.operation.name":"execute_tool"}))
             logical_spans[aid]=logical
         logical=logical_spans[aid]
