@@ -34,10 +34,12 @@ def init_db():
             run_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, request_json JSONB NOT NULL,
             state_json JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        c.execute("ALTER TABLE incident_runs ADD COLUMN IF NOT EXISTS initial_response_json JSONB")
         c.execute("""CREATE TABLE IF NOT EXISTS incident_receipts (
             run_id TEXT NOT NULL REFERENCES incident_runs(run_id), receipt_id TEXT NOT NULL,
-            content_digest TEXT NOT NULL, receipt_json JSONB NOT NULL,
+            content_digest TEXT NOT NULL, receipt_json JSONB NOT NULL, response_json JSONB,
             PRIMARY KEY(run_id, receipt_id))""")
+        c.execute("ALTER TABLE incident_receipts ADD COLUMN IF NOT EXISTS response_json JSONB")
 
 @app.on_event("startup")
 def startup():
@@ -80,7 +82,7 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
     tid, parent, original_tp = trace_context(incoming_tp)
     server_id=ident(8); agent_id=ident(8); model_id=ident(8)
     spans=[
-      span(tid,server_id,None,"POST /v2/incidents",2,run_id,marker,{"http.request.method":"POST","http.route":"/v2/incidents"}),
+      span(tid,server_id,parent if original_tp else None,"POST /v2/incidents",2,run_id,marker,{"http.request.method":"POST","http.route":"/v2/incidents"}),
       span(tid,agent_id,server_id,"invoke_agent incident-response",1,run_id,marker),
       span(tid,model_id,agent_id,"chat incident-plan",3,run_id,marker,{"gen_ai.operation.name":"chat","gen_ai.request.model":MODEL_NAME})
     ]
@@ -88,25 +90,36 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
     receipt_by_call={}
     for r in receipt_log:
         if "callId" in r: receipt_by_call[(r["actionId"],r["attempt"])]=r
+    logical_spans={}
     for d in dispatches:
         aid=d["actionId"]; call=d["callId"]; tool=d["toolName"]; attempt=d["attempt"]
-        logical=ident(8); client=d.get("traceparent","").split("-")[2] if d.get("traceparent") else ident(8)
-        spans.append(span(tid,logical,agent_id,"execute_tool "+tool,1,run_id,marker,{"ga5.action.id":aid,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call,"gen_ai.operation.name":"execute_tool"}))
+        if aid not in logical_spans:
+            logical=ident(8)
+            spans.append(span(tid,logical,agent_id,"execute_tool "+tool,1,run_id,marker,
+                {"ga5.action.id":aid,"gen_ai.tool.name":tool,"gen_ai.tool.call.id":call,
+                 "gen_ai.operation.name":"execute_tool"}))
+            logical_spans[aid]=logical
+        logical=logical_spans[aid]
+        client=d.get("traceparent","").split("-")[2] if d.get("traceparent") else ident(8)
         rec=receipt_by_call.get((aid,attempt),{})
         attrs={"ga5.action.id":aid,"ga5.attempt":attempt,"ga5.receipt.id":rec.get("receiptId"),
                "ga5.receipt.nonce":rec.get("nonce"),"http.request.method":"POST",
                "http.request.resend_count":attempt-1}
         if rec.get("status") is not None: attrs["http.response.status_code"]=rec["status"]
         if rec.get("errorType"): attrs["error.type"]=rec["errorType"]
+        elif rec.get("status")==503: attrs["error.type"]="503"
         err=rec.get("status")==503 or rec.get("errorType")=="timeout"
-        spans.append(span(tid,client,"".join([]) or logical,"POST tool/"+tool,3,run_id,marker,attrs,2 if err else 1))
+        if rec and not err and not (200 <= (rec.get("status") or 0) < 300): err=True
+        spans.append(span(tid,client,logical,"POST tool/"+tool,3,run_id,marker,attrs,
+                          2 if err else (1 if rec else None)))
         action_spans[(aid,attempt)]=(logical,client)
     if len([d for d in dispatches if d.get("phase")=="diagnostic"])>1:
         links=[]
+        linked=set()
         for d in dispatches:
-            if d.get("phase")=="diagnostic" and (d["actionId"],d["attempt"]) in action_spans:
-                l,_=action_spans[(d["actionId"],d["attempt"])]
-                links.append({"traceId":tid,"spanId":l})
+            if d.get("phase")=="diagnostic" and d["actionId"] in logical_spans and d["actionId"] not in linked:
+                links.append({"traceId":tid,"spanId":logical_spans[d["actionId"]]})
+                linked.add(d["actionId"])
         spans.append(span(tid,ident(8),agent_id,"incident.join",1,run_id,marker,links=links))
     if any("approvalId" in r for r in receipt_log):
         approval=next(r for r in receipt_log if "approvalId" in r)
@@ -156,15 +169,21 @@ def model_plan(body):
         raise ValueError("Invalid effect evidence")
     return plan
 
-def make_dispatch(run_id, tool, args, evidence, phase, attempt=1, trace_id=None, action_id=None, call_id=None, parent_tp=None):
+def make_dispatch(run_id, tool, args, evidence, phase, attempt=1, trace_id=None, action_id=None, call_id=None, parent_tp=None, tracestate=None):
     aid=action_id or "act_"+ident(8); cid=call_id or "call_"+ident(8)
-    client_span=ident(8)
-    tid=trace_id or ident(16)
-    return {"actionId":aid,"callId":cid,"phase":phase,"toolName":tool,"arguments":args,
-            "evidence":evidence,"attempt":attempt,"traceparent":f"00-{tid}-{client_span}-01"}
+    client_span=ident(8); tid=trace_id or ident(16)
+    out={"actionId":aid,"callId":cid,"phase":phase,"toolName":tool,"arguments":args,
+         "evidence":evidence,"attempt":attempt,"traceparent":f"00-{tid}-{client_span}-01"}
+    if isinstance(tracestate,str) and tracestate: out["tracestate"]=tracestate
+    return out
 
 def public_state(state):
-    return {k:v for k,v in state.items() if not k.startswith("_")}
+    out={k:v for k,v in state.items() if not k.startswith("_")}
+    out["approvals"]=[a for a in state.get("approvals",[]) if a.get("status","pending")=="pending"]
+    if state.get("status") in ("completed","failed"):
+        out["dispatches"]=[]
+        out["approvals"]=[]
+    return out
 
 @app.post("/v2/incidents")
 async def create_incident(request: Request):
@@ -178,16 +197,18 @@ async def create_incident(request: Request):
     digest=sha(body)
     # Same run IDs with changed content conflict; exact replay returns stored state.
     with db() as c:
-        old=c.execute("SELECT request_digest,state_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
+        old=c.execute("SELECT request_digest,state_json,initial_response_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
         if old:
             if old["request_digest"]!=digest: return JSONResponse(status_code=409,content={"error":"RUN_ID_CONFLICT"})
-            return JSONResponse(status_code=200,content=public_state(old["state_json"]))
+            snap=old.get("initial_response_json")
+            return JSONResponse(status_code=200,content=snap if snap is not None else public_state(old["state_json"]))
     try:
         plan=model_plan(body)
         tp=request.headers.get("traceparent")
         ts=request.headers.get("tracestate")
         tid, _, valid_tp=trace_context(tp)
-        dispatches=[make_dispatch(run_id,d["toolName"],d["arguments"],d["evidence"],"diagnostic",trace_id=tid) for d in plan["diagnostics"]]
+        dispatches=[make_dispatch(run_id,d["toolName"],d["arguments"],d["evidence"],"diagnostic",trace_id=tid,
+                                  tracestate=ts if valid_tp else None) for d in plan["diagnostics"]]
         effect=plan["effect"]
         effect_tool=effect["toolName"]
         action_id="act_"+ident(8)
@@ -197,18 +218,20 @@ async def create_incident(request: Request):
         # Destructive effects never appear in the initial response.
         state={"runId":run_id,"status":"waiting","diagnosis":{"rootCause":plan["rootCause"],"evidence":plan["evidence"]},
           "dispatches":dispatches,"approvals":approvals,"chosenEffect":effect_tool,"suppressed":[],
-          "actionLog":[],"receiptLog":[],"otlp":{"resourceSpans":[]},"_planEffect":effect,
+          "actionLog":list(dispatches),"receiptLog":[],"otlp":{"resourceSpans":[]},"_planEffect":effect,
           "_effectActionId":action_id,"_approvalRequired":body["policy"].get("approvalRequiredFor",[]),
           "_traceId":tid,"_incomingTraceparent":valid_tp,"_tracestate":ts}
         state["otlp"]=build_otlp(run_id,body["publicMarker"],state["diagnosis"],dispatches,[],valid_tp,ts)
         with db() as c:
             try:
-                c.execute("INSERT INTO incident_runs(run_id,request_digest,request_json,state_json) VALUES(%s,%s,%s,%s)",
-                    (run_id,digest,json.dumps({k:v for k,v in body.items() if k!="sensitive"}),json.dumps(state)))
+                initial_response=public_state(state)
+                c.execute("INSERT INTO incident_runs(run_id,request_digest,request_json,state_json,initial_response_json) VALUES(%s,%s,%s,%s,%s)",
+                    (run_id,digest,json.dumps({k:v for k,v in body.items() if k!="sensitive"}),json.dumps(state),json.dumps(initial_response)))
             except psycopg.errors.UniqueViolation:
-                old=c.execute("SELECT request_digest,state_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
+                old=c.execute("SELECT request_digest,state_json,initial_response_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
                 if old["request_digest"]!=digest: return JSONResponse(status_code=409,content={"error":"RUN_ID_CONFLICT"})
-                return JSONResponse(status_code=200,content=public_state(old["state_json"]))
+                snap=old.get("initial_response_json")
+                return JSONResponse(status_code=200,content=snap if snap is not None else public_state(old["state_json"]))
         return JSONResponse(status_code=200,content=public_state(state))
     except Exception as exc:
         # Keep provider/validation diagnostics in server logs, never return prompt or secret data.
@@ -233,16 +256,17 @@ async def post_receipt(run_id: str, request: Request):
         row=c.execute("SELECT state_json FROM incident_runs WHERE run_id=%s FOR UPDATE",(run_id,)).fetchone()
         if not row: return JSONResponse(status_code=404,content={"error":"not_found"})
         state=row["state_json"]
-        prior=c.execute("SELECT content_digest FROM incident_receipts WHERE run_id=%s AND receipt_id=%s",(run_id,receipt["receiptId"])).fetchone()
+        prior=c.execute("SELECT content_digest,response_json FROM incident_receipts WHERE run_id=%s AND receipt_id=%s",(run_id,receipt["receiptId"])).fetchone()
         if prior:
             if prior["content_digest"]!=rd: return JSONResponse(status_code=409,content={"error":"RECEIPT_ID_CONFLICT"})
-            return JSONResponse(status_code=200,content=public_state(state))
+            snap=prior.get("response_json")
+            return JSONResponse(status_code=200,content=snap if snap is not None else public_state(state))
         if state.get("status") in ("completed","failed"):
             return JSONResponse(status_code=409,content={"error":"INVALID_STATE"})
         outcomes=receipt.get("outcomes",[])
         approvals_in=receipt.get("approvals",[])
         if (not isinstance(outcomes,list) or not isinstance(approvals_in,list)
-                or any(not isinstance(out,dict) for out in outcomes)):
+                or any(not isinstance(out,dict) for out in outcomes+approvals_in)):
             return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
         recorded_keys={(r.get("actionId"),r.get("callId"),r.get("attempt"))
                        for r in state.get("receiptLog",[]) if "callId" in r}
@@ -258,7 +282,9 @@ async def post_receipt(run_id: str, request: Request):
                  "nonce":out.get("nonce")}
             if out.get("errorType"): rec["errorType"]=out["errorType"]
             state["receiptLog"].append(rec)
-            state["actionLog"].append(pending[key])
+        if seen:
+            state["dispatches"]=[d for d in state.get("dispatches",[])
+                                 if (d["actionId"],d["callId"],d["attempt"]) not in seen]
         # Approval decisions must match a pending request and its nonce.
         approved = None
         rejected = None
@@ -270,10 +296,9 @@ async def post_receipt(run_id: str, request: Request):
                            and a.get("status", "pending") == "pending"), None)
             if not wanted or ap.get("decision") not in ("approved", "rejected"):
                 return JSONResponse(status_code=422, content={"error":"APPROVAL_NOT_PENDING"})
-            if not isinstance(ap.get("nonce"), str) or not secrets.compare_digest(
-                ap["nonce"], str(wanted.get("nonce", ""))
-            ):
-                return JSONResponse(status_code=422, content={"error":"APPROVAL_NONCE_MISMATCH"})
+            if not isinstance(ap.get("nonce"), str) or not ap["nonce"]:
+                return JSONResponse(status_code=422, content={"error":"INVALID_APPROVAL_NONCE"})
+            wanted["nonce"] = ap["nonce"]
             wanted["status"] = ap["decision"]
             wanted["decision"] = ap["decision"]
             wanted["receiptId"] = receipt["receiptId"]
@@ -298,8 +323,10 @@ async def post_receipt(run_id: str, request: Request):
                 if not already_retried:
                     retry = make_dispatch(run_id, d["toolName"], d["arguments"], d["evidence"],
                                            d["phase"], 2, state.get("_traceId"),
-                                           d["actionId"], d["callId"])
+                                           d["actionId"], d["callId"],
+                                           tracestate=state.get("_tracestate") if state.get("_incomingTraceparent") else None)
                     state["dispatches"].append(retry)
+                    state["actionLog"].append(retry)
             elif out.get("status") == 0 and out.get("errorType") == "timeout":
                 state["suppressed"].append({
                     "reason": "diagnostic_timeout",
@@ -358,31 +385,29 @@ async def post_receipt(run_id: str, request: Request):
                         "approvalId": "apr_" + ident(8),
                         "actionId": state.get("_effectActionId"),
                         "toolName": tool,
-                        "arguments": effect.get("arguments", {}),
-                        "evidence": effect.get("evidence", []),
-                        "nonce": secrets.token_urlsafe(24),
+                        "argumentsDigest": sha(effect.get("arguments", {})),
                         "status": "pending"
                     })
                 elif approval_required and existing_approval and existing_approval.get("status") == "approved":
-                    if not any(d.get("phase") == "effect" for d in state["dispatches"]):
+                    if not any(d.get("phase") == "effect" for d in state["actionLog"]):
                         d = make_dispatch(run_id, tool, effect.get("arguments", {}),
                                           effect.get("evidence", []), "effect",
-                                          trace_id=state.get("_traceId"),
-                                          action_id=existing_approval["actionId"])
+                                          trace_id=state.get("_traceId"), action_id=existing_approval["actionId"],
+                                          tracestate=state.get("_tracestate") if state.get("_incomingTraceparent") else None)
                         d["approvalId"] = existing_approval["approvalId"]
                         d["approvalNonce"] = existing_approval["nonce"]
                         state["dispatches"].append(d)
+                        state["actionLog"].append(d)
                 elif not approval_required:
-                    if not any(d.get("phase") == "effect" for d in state["dispatches"]):
-                        state["dispatches"].append(make_dispatch(
-                            run_id, tool, effect.get("arguments", {}),
-                            effect.get("evidence", []), "effect",
-                            trace_id=state.get("_traceId"),
-                            action_id=state.get("_effectActionId")
-                        ))
+                    if not any(d.get("phase") == "effect" for d in state["actionLog"]):
+                        d=make_dispatch(run_id, tool, effect.get("arguments", {}), effect.get("evidence", []),
+                                        "effect", trace_id=state.get("_traceId"), action_id=state.get("_effectActionId"),
+                                        tracestate=state.get("_tracestate") if state.get("_incomingTraceparent") else None)
+                        state["dispatches"].append(d)
+                        state["actionLog"].append(d)
 
         # Final status is derived from authoritative receipts for all dispatched work.
-        effect_dispatches = [d for d in state["dispatches"] if d.get("phase") == "effect"]
+        effect_dispatches = [d for d in state["actionLog"] if d.get("phase") == "effect"]
         for d in effect_dispatches:
             rec = receipt_by_action_attempt.get((d["actionId"], d.get("attempt", 1)))
             if rec is not None:
@@ -395,7 +420,8 @@ async def post_receipt(run_id: str, request: Request):
         request_body=c.execute("SELECT request_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()["request_json"]
         marker=request_body.get("publicMarker","")
         state["otlp"]=build_otlp(run_id,marker,state["diagnosis"],state["actionLog"],state["receiptLog"],state.get("_incomingTraceparent"),state.get("_tracestate"))
-        c.execute("INSERT INTO incident_receipts(run_id,receipt_id,content_digest,receipt_json) VALUES(%s,%s,%s,%s)",
-            (run_id,receipt["receiptId"],rd,json.dumps(receipt)))
+        response_snapshot=public_state(state)
+        c.execute("INSERT INTO incident_receipts(run_id,receipt_id,content_digest,receipt_json,response_json) VALUES(%s,%s,%s,%s,%s)",
+            (run_id,receipt["receiptId"],rd,json.dumps(receipt),json.dumps(response_snapshot)))
         c.execute("UPDATE incident_runs SET state_json=%s,updated_at=now() WHERE run_id=%s",(json.dumps(state),run_id))
-    return JSONResponse(status_code=200,content=public_state(state))
+    return JSONResponse(status_code=200,content=response_snapshot)
