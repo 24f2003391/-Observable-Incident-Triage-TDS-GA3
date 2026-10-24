@@ -147,6 +147,7 @@ def model_plan(body):
       "toolCatalog":catalog,
       "policy":{k:policy.get(k) for k in ("maximumDiagnostics","effectTools","approvalRequiredFor")},
       "availableEvidenceIds":evidence_lines,
+      "evidenceRule":"Every evidence value must be copied as the exact full bracketed ID, including square brackets, such as [E1]. Do not return bare IDs like E1, explanations, or altered labels.",
       "outputSchema":{"rootCause":"exact allowedRootCauses value","evidence":["2-4 IDs copied exactly from availableEvidenceIds"],"diagnostics":[{"toolName":"exact toolCatalog name","arguments":{},"evidence":["IDs copied exactly from availableEvidenceIds"]}],"effect":{"toolName":"exact tool name selected from policy.effectTools (must also exist in toolCatalog)","arguments":{},"evidence":["IDs copied exactly from availableEvidenceIds"]}}
     }
     key=os.getenv("GEMINI_API_KEY")
@@ -182,18 +183,31 @@ def model_plan(body):
     except (KeyError, IndexError, TypeError):
         raise ValueError("Model returned no JSON content")
     plan=json.loads(response_text)
-    # Normalize only a bracket-format omission when the underlying ID is known
-    # from the transcript. Never admit an ID that is not present in the source.
+    # Normalize formatting variations only when they unambiguously identify
+    # an evidence ID extracted from the transcript. Never invent or infer IDs.
     valid=set(evidence_lines)
+    def normalize_one(item):
+        if not isinstance(item,str):
+            return item
+        text=item.strip()
+        if text in valid:
+            return text
+        # Accept a bare ID (for example E1) only when its bracketed form exists.
+        bracketed="["+text+"]"
+        if bracketed in valid:
+            return bracketed
+        # Some model responses append a short explanation to a citation. Map it
+        # only if exactly one known source ID appears in the string.
+        matches=[e for e in evidence_lines if e in text]
+        if len(matches)==1:
+            return matches[0]
+        return item
     def normalize_evidence(value):
+        if isinstance(value,str):
+            value=[value]
         if not isinstance(value,list):
             return value
-        normalized=[]
-        for item in value:
-            if isinstance(item,str) and item not in valid and ("["+item+"]") in valid:
-                item="["+item+"]"
-            normalized.append(item)
-        return normalized
+        return [normalize_one(item) for item in value]
     plan["evidence"]=normalize_evidence(plan.get("evidence",[]))
     if isinstance(plan.get("diagnostics"),list):
         for diagnostic in plan["diagnostics"]:
