@@ -249,61 +249,138 @@ async def post_receipt(run_id: str, request: Request):
             if out.get("errorType"): rec["errorType"]=out["errorType"]
             state["receiptLog"].append(rec)
             state["actionLog"].append(pending[key])
-        # Only a receipt matching the pending approval can authorize the effect.
-        approved=None
+        # Approval decisions must match a pending request and its nonce.
+        approved = None
+        rejected = None
         for ap in approvals_in:
-            wanted=next((a for a in state.get("approvals",[]) if a["approvalId"]==ap.get("approvalId")),None)
-            if not wanted or ap.get("decision") not in ("approved","rejected"): return JSONResponse(status_code=422,content={"error":"APPROVAL_NOT_PENDING"})
-            state["receiptLog"].append({"receiptId":receipt["receiptId"],"approvalId":ap["approvalId"],"decision":ap["decision"],"nonce":ap.get("nonce")})
-            if ap.get("decision")=="approved": approved=(wanted,ap)
-        if seen:
-            for out in outcomes:
-                if out.get("status")==503 and out.get("attempt")==1:
-                    d=pending[(out["actionId"],out["callId"],out["attempt"])]
-                    retry=make_dispatch(run_id,d["toolName"],d["arguments"],d["evidence"],d["phase"],2,state.get("_traceId"),d["actionId"],d["callId"])
+            if not isinstance(ap, dict):
+                return JSONResponse(status_code=422, content={"error":"INVALID_APPROVAL"})
+            wanted = next((a for a in state.get("approvals", [])
+                           if a.get("approvalId") == ap.get("approvalId")
+                           and a.get("status", "pending") == "pending"), None)
+            if not wanted or ap.get("decision") not in ("approved", "rejected"):
+                return JSONResponse(status_code=422, content={"error":"APPROVAL_NOT_PENDING"})
+            if not isinstance(ap.get("nonce"), str) or not secrets.compare_digest(
+                ap["nonce"], str(wanted.get("nonce", ""))
+            ):
+                return JSONResponse(status_code=422, content={"error":"APPROVAL_NONCE_MISMATCH"})
+            wanted["status"] = ap["decision"]
+            wanted["decision"] = ap["decision"]
+            wanted["receiptId"] = receipt["receiptId"]
+            state["receiptLog"].append({
+                "receiptId": receipt["receiptId"],
+                "approvalId": ap["approvalId"],
+                "actionId": wanted.get("actionId"),
+                "decision": ap["decision"],
+                "nonce": ap["nonce"]
+            })
+            if ap["decision"] == "approved":
+                approved = (wanted, ap)
+            else:
+                rejected = (wanted, ap)
+
+        # A single 503 retry is allowed for each diagnostic action.
+        for out in outcomes:
+            if out.get("status") == 503 and out.get("attempt") == 1:
+                d = pending[(out["actionId"], out["callId"], out["attempt"])]
+                already_retried = any(x.get("actionId") == d["actionId"] and x.get("attempt") == 2
+                                      for x in state["dispatches"])
+                if not already_retried:
+                    retry = make_dispatch(run_id, d["toolName"], d["arguments"], d["evidence"],
+                                           d["phase"], 2, state.get("_traceId"),
+                                           d["actionId"], d["callId"])
                     state["dispatches"].append(retry)
-                elif out.get("status")==0 and out.get("errorType")=="timeout":
-                    state["suppressed"].append({"reason":"diagnostic_timeout","actionId":out["actionId"]})
-            # Retry-only responses contain no approval request and no effect dispatch.
-            retrying=any(d.get("attempt")==2 for d in state["dispatches"] if d["actionId"] in {o.get("actionId") for o in outcomes})
-            if not retrying:
-                diagnostics=[d for d in state["dispatches"] if d["phase"]=="diagnostic"]
-                successful={(r["actionId"],r["attempt"]) for r in state["receiptLog"] if "callId" in r and r.get("status",0)>=200 and r.get("status",0)<300}
-                all_ok=all(any(aid==d["actionId"] and at==d["attempt"] for aid,at in successful) for d in diagnostics if d.get("attempt")==max(x["attempt"] for x in diagnostics if x["actionId"]==d["actionId"]))
-                timed_out=any(r.get("status")==0 and r.get("errorType")=="timeout" for r in state["receiptLog"])
-                if all_ok and not timed_out:
-                    effect=state.get("_planEffect",{})
-                    tool=effect.get("toolName")
-                    if tool in set(state.get("_approvalRequired",[])) and not approved:
-                        pass
-                    elif tool in ("rollback_deployment","disable_feature") and not approved:
-                        pass
-                    elif tool in ("rollback_deployment","disable_feature") and approved:
-                        wanted,ap=approved
-                        state["dispatches"].append(make_dispatch(run_id,tool,effect.get("arguments",{}),effect.get("evidence",[]),"effect",trace_id=state.get("_traceId"),action_id=wanted["actionId"]))
-                        state["dispatches"][-1]["approvalId"]=wanted["approvalId"]
-                        state["dispatches"][-1]["approvalNonce"]=ap.get("nonce")
-                    elif not state.get("approvals"):
-                        state["dispatches"].append(make_dispatch(run_id,tool,effect.get("arguments",{}),effect.get("evidence",[]),"effect",trace_id=state.get("_traceId"),action_id=state.get("_effectActionId")))
-                    elif approved:
-                        wanted,ap=approved
-                        state["dispatches"].append(make_dispatch(run_id,tool,effect.get("arguments",{}),effect.get("evidence",[]),"effect",trace_id=state.get("_traceId"),action_id=wanted["actionId"]))
-                        state["dispatches"][-1]["approvalId"]=wanted["approvalId"]; state["dispatches"][-1]["approvalNonce"]=ap.get("nonce")
-                elif timed_out:
-                    state["status"]="failed"
-                    state["suppressed"].append({"reason":"dependent_effect_suppressed"})
-        if state.get("status")=="waiting" and state.get("dispatches") and all(
-            any(r.get("actionId")==d["actionId"] and r.get("attempt")==d["attempt"] for r in state["receiptLog"] if "callId" in r)
-            for d in state["dispatches"]):
-            # Mark terminal only after all diagnostics and effect dispatches have receipts.
-            diagnostics=[d for d in state["dispatches"] if d["phase"]=="diagnostic"]
-            effects=[d for d in state["dispatches"] if d["phase"]=="effect"]
-            if effects and all(any(r.get("actionId")==d["actionId"] and r.get("attempt")==d["attempt"] and r.get("status",0)>=200 and r.get("status",0)<300 for r in state["receiptLog"] if "callId" in r) for d in effects):
-                state["status"]="completed"
-            elif not effects and (state.get("approvals") and not approved):
-                state["status"]="waiting"
-            elif not effects and state.get("suppressed"):
-                state["status"]="failed"
+            elif out.get("status") == 0 and out.get("errorType") == "timeout":
+                state["suppressed"].append({
+                    "reason": "diagnostic_timeout",
+                    "actionId": out["actionId"]
+                })
+
+        diagnostics = [d for d in state.get("dispatches", []) if d.get("phase") == "diagnostic"]
+        latest_diagnostics = {}
+        for d in diagnostics:
+            previous = latest_diagnostics.get(d["actionId"])
+            if previous is None or d.get("attempt", 1) > previous.get("attempt", 1):
+                latest_diagnostics[d["actionId"]] = d
+
+        receipt_by_action_attempt = {
+            (r.get("actionId"), r.get("attempt")): r
+            for r in state.get("receiptLog", []) if "callId" in r
+        }
+        diagnostic_results = [
+            receipt_by_action_attempt.get((d["actionId"], d.get("attempt", 1)))
+            for d in latest_diagnostics.values()
+        ]
+        any_retry_pending = any(
+            d.get("phase") == "diagnostic"
+            and d.get("attempt") == 2
+            and (d.get("actionId"), d.get("attempt")) not in receipt_by_action_attempt
+            for d in state["dispatches"]
+        )
+        timed_out = any(
+            r.get("status") == 0 and r.get("errorType") == "timeout"
+            for r in state.get("receiptLog", [])
+        )
+
+        if timed_out:
+            state["status"] = "failed"
+            if not any(x.get("reason") == "dependent_effect_suppressed" for x in state["suppressed"]):
+                state["suppressed"].append({"reason":"dependent_effect_suppressed"})
+        elif not any_retry_pending and diagnostic_results and all(r is not None for r in diagnostic_results):
+            all_ok = all(200 <= (r.get("status") or 0) < 300 for r in diagnostic_results)
+            if not all_ok:
+                state["status"] = "failed"
+                state["suppressed"].append({"reason":"dependent_effect_suppressed"})
+            else:
+                effect = state.get("_planEffect", {})
+                tool = effect.get("toolName")
+                approval_required = tool in set(state.get("_approvalRequired", []))
+                existing_approval = next(
+                    (a for a in state.get("approvals", [])
+                     if a.get("actionId") == state.get("_effectActionId")), None
+                )
+                if rejected:
+                    state["status"] = "failed"
+                    state["suppressed"].append({"reason":"approval_rejected"})
+                elif approval_required and existing_approval is None:
+                    # Do not dispatch a destructive effect until a nonce-bound approval is returned.
+                    state["approvals"].append({
+                        "approvalId": "apr_" + ident(8),
+                        "actionId": state.get("_effectActionId"),
+                        "toolName": tool,
+                        "arguments": effect.get("arguments", {}),
+                        "evidence": effect.get("evidence", []),
+                        "nonce": secrets.token_urlsafe(24),
+                        "status": "pending"
+                    })
+                elif approval_required and existing_approval and existing_approval.get("status") == "approved":
+                    if not any(d.get("phase") == "effect" for d in state["dispatches"]):
+                        d = make_dispatch(run_id, tool, effect.get("arguments", {}),
+                                          effect.get("evidence", []), "effect",
+                                          trace_id=state.get("_traceId"),
+                                          action_id=existing_approval["actionId"])
+                        d["approvalId"] = existing_approval["approvalId"]
+                        d["approvalNonce"] = existing_approval["nonce"]
+                        state["dispatches"].append(d)
+                elif not approval_required:
+                    if not any(d.get("phase") == "effect" for d in state["dispatches"]):
+                        state["dispatches"].append(make_dispatch(
+                            run_id, tool, effect.get("arguments", {}),
+                            effect.get("evidence", []), "effect",
+                            trace_id=state.get("_traceId"),
+                            action_id=state.get("_effectActionId")
+                        ))
+
+        # Final status is derived from authoritative receipts for all dispatched work.
+        effect_dispatches = [d for d in state["dispatches"] if d.get("phase") == "effect"]
+        for d in effect_dispatches:
+            rec = receipt_by_action_attempt.get((d["actionId"], d.get("attempt", 1)))
+            if rec is not None:
+                if 200 <= (rec.get("status") or 0) < 300:
+                    state["status"] = "completed"
+                else:
+                    state["status"] = "failed"
+                    state["suppressed"].append({"reason":"effect_failed","actionId":d["actionId"]})
         # Remove internal fields from persisted/public state only after constructing final telemetry.
         request_body=c.execute("SELECT request_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()["request_json"]
         marker=request_body.get("publicMarker","")
