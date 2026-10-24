@@ -350,6 +350,29 @@ async def post_receipt(run_id: str, request: Request):
                        for r in state.get("receiptLog",[]) if "callId" in r}
         pending={ (d["actionId"],d["callId"],d["attempt"]):d for d in state.get("dispatches",[])
                   if (d["actionId"],d["callId"],d["attempt"]) not in recorded_keys }
+        # Preflight all references and approval nonces before mutating state. A
+        # mixed receipt containing one valid outcome and one invalid approval
+        # must be rejected atomically rather than partially applied.
+        preflight_outcomes=set()
+        for out in outcomes:
+            key=(out["actionId"],out["callId"],out["attempt"])
+            if key not in pending or key in preflight_outcomes:
+                return JSONResponse(status_code=422,content={"error":"OUTCOME_NOT_PENDING"})
+            preflight_outcomes.add(key)
+        preflight_approvals=set()
+        for ap in approvals_in:
+            if ap["approvalId"] in preflight_approvals:
+                return JSONResponse(status_code=422,content={"error":"INVALID_APPROVAL"})
+            preflight_approvals.add(ap["approvalId"])
+            wanted=next((a for a in state.get("approvals",[])
+                         if a.get("approvalId")==ap["approvalId"]
+                         and a.get("status","pending")=="pending"),None)
+            if not wanted or ap["decision"] not in ("approved","rejected"):
+                return JSONResponse(status_code=422,content={"error":"APPROVAL_NOT_PENDING"})
+            expected_nonce=wanted.get("nonce")
+            if (not isinstance(expected_nonce,str) or not expected_nonce
+                    or not hmac.compare_digest(ap["nonce"],expected_nonce)):
+                return JSONResponse(status_code=422,content={"error":"INVALID_APPROVAL_NONCE"})
         seen=set()
         for out in outcomes:
             key=(out.get("actionId"),out.get("callId"),out.get("attempt"))
