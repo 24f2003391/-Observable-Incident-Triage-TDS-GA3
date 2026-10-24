@@ -151,15 +151,36 @@ def model_plan(body):
     key=os.getenv("GEMINI_API_KEY")
     if not key:
         raise ValueError("Model provider is not configured")
-    from google import genai
-    from google.genai import types
-    # Bound the provider request and disable SDK retries so this endpoint stays
-    # inside the grader's 18-second request deadline.
-    client=genai.Client(api_key=key, http_options=types.HttpOptions(
-        timeout=13000, retry_options=types.HttpRetryOptions(attempts=1)))
-    response=client.models.generate_content(model=MODEL_NAME, contents=canonical(prompt),
-       config={"response_mime_type":"application/json","temperature":0})
-    plan=json.loads(response.text)
+    # Use a bounded REST request and a small output budget: the plan is a
+    # compact JSON object, and the grader's end-to-end request deadline is 18s.
+    import requests
+    api_url=f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
+    payload={"contents":[{"role":"user","parts":[{"text":canonical(prompt)}]}],
+             "generationConfig":{"temperature":0,"responseMimeType":"application/json","maxOutputTokens":2048}}
+    prompt_chars=len(canonical(prompt))
+    request_json_chars=len(json.dumps(payload,ensure_ascii=False,separators=(",",":")))
+    logging.getLogger("uvicorn.error").info(
+        "AI_REQUEST_START provider=gemini model=%s prompt_chars=%s request_json_chars=%s",
+        MODEL_NAME,prompt_chars,request_json_chars)
+    started=time.monotonic()
+    try:
+        response=requests.post(api_url,params={"key":key},json=payload,timeout=12)
+    except requests.RequestException as exc:
+        logging.getLogger("uvicorn.error").warning(
+            "AI_REQUEST_END provider=gemini model=%s error_type=%s elapsed_ms=%s",
+            MODEL_NAME,type(exc).__name__,int((time.monotonic()-started)*1000))
+        raise
+    logging.getLogger("uvicorn.error").info(
+        "AI_REQUEST_END provider=gemini model=%s status=%s elapsed_ms=%s response_bytes=%s",
+        MODEL_NAME,response.status_code,int((time.monotonic()-started)*1000),len(response.content))
+    if not response.ok:
+        raise RuntimeError(f"Gemini HTTP {response.status_code}")
+    data=response.json()
+    try:
+        response_text=data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("Model returned no JSON content")
+    plan=json.loads(response_text)
     if plan.get("rootCause") not in allowed: raise ValueError("Invalid model root cause")
     valid=set(evidence_lines)
     ev=plan.get("evidence",[])
