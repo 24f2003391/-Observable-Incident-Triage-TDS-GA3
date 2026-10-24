@@ -1,4 +1,4 @@
-import os, json, hashlib, re, uuid, secrets, time
+import os, json, hashlib, re, uuid, secrets, time, logging
 from datetime import datetime, timezone
 from typing import Any
 from fastapi import FastAPI, Request
@@ -206,8 +206,10 @@ async def create_incident(request: Request):
                 if old["request_digest"]!=digest: return JSONResponse(status_code=409,content={"error":"RUN_ID_CONFLICT"})
                 return JSONResponse(status_code=200,content=public_state(old["state_json"]))
         return JSONResponse(status_code=200,content=public_state(state))
-    except Exception:
-        return JSONResponse(status_code=422,content={"error":"incident_plan_invalid"})
+    except Exception as exc:
+        # Keep provider/validation diagnostics in server logs, never return prompt or secret data.
+        logging.exception("incident planning failed for run_id=%s (%s)", run_id, type(exc).__name__)
+        return JSONResponse(status_code=422,content={"error":"incident_plan_invalid","detail":type(exc).__name__})
 
 @app.get("/v2/incidents/{run_id}")
 def get_incident(run_id: str):
