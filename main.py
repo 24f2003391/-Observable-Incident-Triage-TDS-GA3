@@ -113,7 +113,7 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
         spans.append(span(tid,client,logical,"POST tool/"+tool,3,run_id,marker,attrs,
                           2 if err else (1 if rec else None)))
         action_spans[(aid,attempt)]=(logical,client)
-    if len([d for d in dispatches if d.get("phase")=="diagnostic"])>1:
+    if len({d["actionId"] for d in dispatches if d.get("phase")=="diagnostic"})>1:
         links=[]
         linked=set()
         for d in dispatches:
