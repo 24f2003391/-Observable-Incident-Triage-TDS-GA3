@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: observable-incident-triage-ga3
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: observable-incident-triage-db
+          property: connectionString
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: PYTHON_VERSION
+        value: 3.12.8
+databases:
+  - name: observable-incident-triage-db
+    region: oregon
+    plan: free
+    databaseName: incident_triage
+    user: incident_triage_user
