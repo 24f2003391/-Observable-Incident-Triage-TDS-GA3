@@ -106,10 +106,10 @@ def build_otlp(run_id, marker, diagnosis, dispatches, receipt_log, incoming_tp=N
                "ga5.receipt.nonce":rec.get("nonce"),"http.request.method":"POST",
                "http.request.resend_count":attempt-1}
         if rec.get("status") is not None: attrs["http.response.status_code"]=rec["status"]
-        if rec.get("errorType"): attrs["error.type"]=rec["errorType"]
-        elif rec.get("status")==503: attrs["error.type"]="503"
         err=rec.get("status")==503 or rec.get("errorType")=="timeout"
-        if rec and not err and not (200 <= (rec.get("status") or 0) < 300): err=True
+        if rec and not (200 <= (rec.get("status") or 0) < 300): err=True
+        if rec.get("status")==503: attrs["error.type"]="503"
+        elif err and rec.get("errorType"): attrs["error.type"]=rec["errorType"]
         spans.append(span(tid,client,logical,"POST tool/"+tool,3,run_id,marker,attrs,
                           2 if err else (1 if rec else None)))
         action_spans[(aid,attempt)]=(logical,client)
@@ -266,7 +266,8 @@ async def post_receipt(run_id: str, request: Request):
         outcomes=receipt.get("outcomes",[])
         approvals_in=receipt.get("approvals",[])
         if (not isinstance(outcomes,list) or not isinstance(approvals_in,list)
-                or any(not isinstance(out,dict) for out in outcomes+approvals_in)):
+                or any(not isinstance(out,dict) for out in outcomes+approvals_in)
+                or (not outcomes and not approvals_in)):
             return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
         recorded_keys={(r.get("actionId"),r.get("callId"),r.get("attempt"))
                        for r in state.get("receiptLog",[]) if "callId" in r}
