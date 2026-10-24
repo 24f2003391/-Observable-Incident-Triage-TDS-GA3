@@ -157,8 +157,7 @@ def make_dispatch(run_id, tool, args, evidence, phase, attempt=1, trace_id=None,
     client_span=ident(8)
     tid=trace_id or ident(16)
     return {"actionId":aid,"callId":cid,"phase":phase,"toolName":tool,"arguments":args,
-            "evidence":evidence,"attempt":attempt,"traceparent":f"00-{tid}-{client_span}-01",
-            "_clientSpanId":client_span}
+            "evidence":evidence,"attempt":attempt,"traceparent":f"00-{tid}-{client_span}-01"}
 
 def public_state(state):
     return {k:v for k,v in state.items() if not k.startswith("_")}
@@ -166,19 +165,19 @@ def public_state(state):
 @app.post("/v2/incidents")
 async def create_incident(request: Request):
     try: body=await request.json()
-    except Exception: return JSONResponse(400,{"error":"invalid_json"})
-    if not isinstance(body,dict) or body.get("profile")!=PROFILE: return JSONResponse(422,{"error":"unsupported_profile"})
+    except Exception: return JSONResponse(status_code=400,content={"error":"invalid_json"})
+    if not isinstance(body,dict) or body.get("profile")!=PROFILE: return JSONResponse(status_code=422,content={"error":"unsupported_profile"})
     for key in ("runId","agentName","publicMarker","incident","toolCatalog","policy"):
-        if key not in body: return JSONResponse(422,{"error":"invalid_request"})
+        if key not in body: return JSONResponse(status_code=422,content={"error":"invalid_request"})
     run_id=body["runId"]
     if not isinstance(run_id,str) or not run_id: return JSONResponse(422,{"error":"invalid_request"})
-    digest=sha({k:v for k,v in body.items() if k!="sensitive"})
+    digest=sha(body)
     # Same run IDs with changed content conflict; exact replay returns stored state.
     with db() as c:
         old=c.execute("SELECT request_digest,state_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
         if old:
-            if old["request_digest"]!=digest: return JSONResponse(409,{"error":"RUN_ID_CONFLICT"})
-            return JSONResponse(200,public_state(old["state_json"]))
+            if old["request_digest"]!=digest: return JSONResponse(status_code=409,content={"error":"RUN_ID_CONFLICT"})
+            return JSONResponse(status_code=200,content=public_state(old["state_json"]))
     try:
         plan=model_plan(body)
         tp=request.headers.get("traceparent")
@@ -207,15 +206,15 @@ async def create_incident(request: Request):
                 old=c.execute("SELECT request_digest,state_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
                 if old["request_digest"]!=digest: return JSONResponse(409,{"error":"RUN_ID_CONFLICT"})
                 return JSONResponse(200,public_state(old["state_json"]))
-        return JSONResponse(200,public_state(state))
+        return JSONResponse(status_code=200,content=public_state(state))
     except Exception:
-        return JSONResponse(422,{"error":"incident_plan_invalid"})
+        return JSONResponse(status_code=422,content={"error":"incident_plan_invalid"})
 
 @app.get("/v2/incidents/{run_id}")
 def get_incident(run_id: str):
     with db() as c:
         row=c.execute("SELECT state_json FROM incident_runs WHERE run_id=%s",(run_id,)).fetchone()
-    if not row: return JSONResponse(404,{"error":"not_found"})
+    if not row: return JSONResponse(status_code=404,content={"error":"not_found"})
     return public_state(row["state_json"])
 
 @app.post("/v2/incidents/{run_id}/receipts")
@@ -223,7 +222,7 @@ async def post_receipt(run_id: str, request: Request):
     try: receipt=await request.json()
     except Exception: return JSONResponse(400,{"error":"invalid_json"})
     if not isinstance(receipt,dict) or not isinstance(receipt.get("receiptId"),str) or not receipt["receiptId"]:
-        return JSONResponse(422,{"error":"invalid_receipt"})
+        return JSONResponse(status_code=422,content={"error":"invalid_receipt"})
     rd=sha(receipt)
     with db() as c:
         row=c.execute("SELECT state_json FROM incident_runs WHERE run_id=%s FOR UPDATE",(run_id,)).fetchone()
@@ -231,17 +230,17 @@ async def post_receipt(run_id: str, request: Request):
         state=row["state_json"]
         prior=c.execute("SELECT content_digest FROM incident_receipts WHERE run_id=%s AND receipt_id=%s",(run_id,receipt["receiptId"])).fetchone()
         if prior:
-            if prior["content_digest"]!=rd: return JSONResponse(409,{"error":"RECEIPT_ID_CONFLICT"})
+            if prior["content_digest"]!=rd: return JSONResponse(status_code=409,content={"error":"RECEIPT_ID_CONFLICT"})
             return JSONResponse(200,public_state(state))
         if state.get("status") in ("completed","failed"):
-            return JSONResponse(409,{"error":"INVALID_STATE"})
+            return JSONResponse(status_code=409,content={"error":"INVALID_STATE"})
         outcomes=receipt.get("outcomes",[])
         approvals_in=receipt.get("approvals",[])
         pending={ (d["actionId"],d["callId"],d["attempt"]):d for d in state.get("dispatches",[]) }
         seen=set()
         for out in outcomes:
             key=(out.get("actionId"),out.get("callId"),out.get("attempt"))
-            if key not in pending or key in seen: return JSONResponse(422,{"error":"OUTCOME_NOT_PENDING"})
+            if key not in pending or key in seen: return JSONResponse(status_code=422,content={"error":"OUTCOME_NOT_PENDING"})
             seen.add(key)
             rec={"receiptId":receipt["receiptId"],"actionId":out["actionId"],"callId":out["callId"],
                  "attempt":out["attempt"],"status":out.get("status"),"resultClass":out.get("resultClass"),
@@ -253,7 +252,7 @@ async def post_receipt(run_id: str, request: Request):
         approved=None
         for ap in approvals_in:
             wanted=next((a for a in state.get("approvals",[]) if a["approvalId"]==ap.get("approvalId")),None)
-            if not wanted or ap.get("decision") not in ("approved","rejected"): return JSONResponse(422,{"error":"APPROVAL_NOT_PENDING"})
+            if not wanted or ap.get("decision") not in ("approved","rejected"): return JSONResponse(status_code=422,content={"error":"APPROVAL_NOT_PENDING"})
             state["receiptLog"].append({"receiptId":receipt["receiptId"],"approvalId":ap["approvalId"],"decision":ap["decision"],"nonce":ap.get("nonce")})
             if ap.get("decision")=="approved": approved=(wanted,ap)
         if seen:
