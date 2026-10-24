@@ -333,7 +333,7 @@ async def post_receipt(run_id: str, request: Request):
                     "actionId": out["actionId"]
                 })
 
-        diagnostics = [d for d in state.get("dispatches", []) if d.get("phase") == "diagnostic"]
+        diagnostics = [d for d in state.get("actionLog", []) if d.get("phase") == "diagnostic"]
         latest_diagnostics = {}
         for d in diagnostics:
             previous = latest_diagnostics.get(d["actionId"])
